@@ -247,6 +247,112 @@ A typical run contains:
 
 Historical profile totals such as all-time `user_owns` and `system_owns` may remain non-zero even when none of those Machines are currently active. They are displayed for context but are not substituted into active Ownership calculations.
 
+## Example output
+
+The output below is based on a real run, with the account state adjusted so the active Ownership matches the displayed rank.
+
+```text
+HTB Rank Planner v1.0.0 — user: example (id=1234567)  tz=Europe/Paris
+Rank (API user/info): rank_id=4
+
+Active content counts
+  Machines:   20
+    - user owns: 16 (user-only: 0)
+    - root owns: 16
+    - unowned:   4
+  Challenges: 198  (active via challenge/list)
+    - solved (ACTIVE):   40
+    - unsolved (ACTIVE): 158
+
+Ownership% (HTB official formula)
+  Current Ownership% = (16 + 16/2 + 40/10) / (20 + 20/2 + 198/10) * 100 = 56.2249%
+  API rank_ownership = 56.2200%   (diff=0.0049%)
+  API profile owns   = user_owns=16 system_owns=16
+
+Rank progress (like HTB profile)
+  Current rank: Pro Hacker (threshold >45.0%)
+  Next rank:    Elite Hacker (threshold >70.0%)
+  Progress:     [###########-------------] 44.9%
+  API rank:     Pro Hacker
+  API next:     Elite Hacker
+  Raw ownership gap to >70.0%: 13.7800%
+
+Per-action ownership gains
+type             |  absolute gain |  relative gain | gain/min (est)
+------------------------------------------------------------------------
+user on machine  |       +1.0040% |         +1.79% |        0.00356
+root on machine  |       +2.0080% |         +3.57% |        0.00712
+user + root      |       +3.0120% |         +5.36% |        0.01068
+challenge        |       +0.2008% |         +0.36% |        0.00730
+
+Minimum achievable gain needed to reach Elite Hacker (>70.0%): +13.8554%
+
+machine/profile [############################] 4/4
+challenge/info  [############################] 158/158
+
+Fastest path (maximize % gain per minute; DP minimizes total estimated time)
+  Steps: 13   Flags: 17   Est time: 1h29m
+  Projected ownership%: 70.0803%   (gain 6.9000 numerator points)
+  Recommended actions:
+    type         | name                         |  diff |     fb(u/r) |    est |     gain |  gain/min | flags
+    -------------+------------------------------+-------+-------------+--------+----------+-----------+------
+    machine_full | Management                   |   4.0 |       6m/7m |     7m |  3.0120% |   0.43653 |     2
+    machine_full | Paperwork                    |   4.1 |       6m/8m |     8m |  3.0120% |   0.39632 |     2
+    machine_full | MakeSense                    |   4.8 |       5m/9m |     9m |  3.0120% |   0.33221 |     2
+    machine_full | Scaffold                     |   5.4 |     28m/11m |    11m |  3.0120% |   0.27976 |     2
+    challenge    | Space Explorer               |   2.7 |       38s/- |     1m |  0.2008% |   0.20080 |     1
+    challenge    | Forklifts R Us               |   2.8 |        1m/- |     1m |  0.2008% |   0.17212 |     1
+    challenge    | CubeMadness1                 |   2.0 |        2m/- |     2m |  0.2008% |   0.11366 |     1
+    challenge    | Ether Tag                    |   3.0 |        2m/- |     2m |  0.2008% |   0.09413 |     1
+    challenge    | Lucky Dice                   |   2.7 |        3m/- |     3m |  0.2008% |   0.06620 |     1
+    challenge    | LightningFast                |   3.1 |        6m/- |     6m |  0.2008% |   0.03523 |     1
+    challenge    | RFlag                        |   2.6 |        7m/- |     7m |  0.2008% |   0.02960 |     1
+    challenge    | No Errors                    |   2.7 |       16m/- |    16m |  0.2008% |   0.01255 |     1
+    challenge    | The Needle                   |   2.9 |       16m/- |    16m |  0.2008% |   0.01255 |     1
+
+Easiest path (greedy: lowest user-rated difficulty, then first-blood time)
+  Steps: 41   Flags: 43   Est time: 11h02m
+  Projected ownership%: 70.0803%   (gain 6.9000 numerator points)
+  Recommended actions:
+    type         | name                         |  diff |     fb(u/r) |    est |     gain |  gain/min | flags
+    -------------+------------------------------+-------+-------------+--------+----------+-----------+------
+    challenge    | CubeMadness1                 |   2.0 |        2m/- |     2m |  0.2008% |   0.11366 |     1
+    challenge    | RFlag                        |   2.6 |        7m/- |     7m |  0.2008% |   0.02960 |     1
+    challenge    | Space Explorer               |   2.7 |       38s/- |     1m |  0.2008% |   0.20080 |     1
+    challenge    | Lucky Dice                   |   2.7 |        3m/- |     3m |  0.2008% |   0.06620 |     1
+    challenge    | No Errors                    |   2.7 |       16m/- |    16m |  0.2008% |   0.01255 |     1
+    challenge    | Forklifts R Us               |   2.8 |        1m/- |     1m |  0.2008% |   0.17212 |     1
+    challenge    | The Needle                   |   2.9 |       16m/- |    16m |  0.2008% |   0.01255 |     1
+    challenge    | Wander                       |   2.9 |       16m/- |    16m |  0.2008% |   0.01255 |     1
+    challenge    | Baby Frame                   |   2.9 |       16m/- |    16m |  0.2008% |   0.01255 |     1
+    challenge    | Ether Tag                    |   3.0 |        2m/- |     2m |  0.2008% |   0.09413 |     1
+    challenge    | Secure Server                |   3.0 |       21m/- |    21m |  0.2008% |   0.00946 |     1
+    challenge    | LightningFast                |   3.1 |        6m/- |     6m |  0.2008% |   0.03523 |     1
+    ... (+29 more)
+
+Hybrid path (DP minimizes weighted time + difficulty)
+  Steps: 13   Flags: 17
+  Projected ownership%: 70.0803%   (gain 6.9000 numerator points)
+  Recommended actions:
+    type         | name                         |  diff |     fb(u/r) |    est |     gain |  gain/min | flags
+    -------------+------------------------------+-------+-------------+--------+----------+-----------+------
+    machine_full | Management                   |   4.0 |       6m/7m |     7m |  3.0120% |   0.43653 |     2
+    machine_full | Paperwork                    |   4.1 |       6m/8m |     8m |  3.0120% |   0.39632 |     2
+    machine_full | MakeSense                    |   4.8 |       5m/9m |     9m |  3.0120% |   0.33221 |     2
+    machine_full | Scaffold                     |   5.4 |     28m/11m |    11m |  3.0120% |   0.27976 |     2
+    ... (+9 more)
+
+First-blood data coverage
+  Machines with FB parsed: 4/4 (missing 0)
+  Challenges with FB parsed: 158/158 (missing 0)
+  Note: remaining items fall back to a difficulty→minutes estimate.
+
+Notes
+  - Cold start time is limited by HTB API rate limits for item-detail endpoints.
+  - With caching enabled, later runs fetch detail data only for newly active IDs.
+  - First-blood time is a heuristic, not a personal completion-time prediction.
+```
+
 ## Tests
 
 The test suite uses Python's built-in `unittest`; there is no separate dev dependency file.
