@@ -239,6 +239,14 @@ class PlannerTests(unittest.TestCase):
             60.0,
         )
 
+    def test_easiest_first_blood_key_uses_full_machine_sum(self):
+        full = action("machine_full", "m1", 1.5, 60.0, fb_user=6.0, fb_root=18.0)
+        upgrade = action("machine_upgrade_root", "m2", 1.0, 45.0, fb_user=6.0, fb_root=18.0)
+        user = action("machine_user", "m3", 0.5, 15.0, fb_user=6.0)
+        self.assertEqual(planner._fb_key_minutes(full), 24.0)
+        self.assertEqual(planner._fb_key_minutes(upgrade), 18.0)
+        self.assertEqual(planner._fb_key_minutes(user), 6.0)
+
     def test_full_machine_with_partial_blood_keeps_difficulty_fallback_floor(self):
         fallback = planner._estimate_minutes_from_difficulty(5.0, "machine")
         self.assertEqual(
