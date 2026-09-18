@@ -109,6 +109,10 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(planner._difficulty_from_value("hard"), 7.5)
         self.assertEqual(planner._difficulty_from_value("insane"), 9.0)
         self.assertEqual(planner._difficulty_from_value(54), 5.4)
+        self.assertEqual(
+            planner._extract_user_rated_difficulty({"stars": 4.9, "difficulty": 70}),
+            7.0,
+        )
 
     def test_time_parser_common_formats(self):
         self.assertEqual(planner._parse_any_time_to_minutes("1H 30M"), 90.0)
@@ -139,6 +143,12 @@ class PlannerTests(unittest.TestCase):
                 {"data": {"blood_difference": "1h 15m"}}
             ),
             75.0,
+        )
+        self.assertEqual(
+            planner.extract_challenge_first_blood_minutes(
+                {"data": {"first_blood_seconds": 120}}
+            ),
+            2.0,
         )
 
     def test_challenge_first_blood_ignores_unrelated_time_and_ids(self):
@@ -299,6 +309,11 @@ class PlannerTests(unittest.TestCase):
         client.request = failing_request
         with self.assertRaises(planner.HTBApiError):
             client.get_machine_profile_cached(7, "Example")
+
+    def test_detail_error_fatality_only_treats_auth_as_run_fatal(self):
+        self.assertTrue(planner._detail_error_is_fatal(planner.HTBApiError("auth", status_code=401)))
+        self.assertFalse(planner._detail_error_is_fatal(planner.HTBApiError("server", status_code=500)))
+        self.assertFalse(planner._detail_error_is_fatal(planner.HTBApiError("rate", status_code=429)))
 
     def test_challenge_detail_does_not_hide_server_errors(self):
         client = planner.HTBClient(token="x")
