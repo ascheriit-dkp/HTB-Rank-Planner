@@ -16,6 +16,7 @@ Current version improvements:
 - Accepts current challenge solve aliases including authUserSolve.
 - Validates/parses difficulty and first-blood fields conservatively.
 - Clean CLI errors by default; --debug keeps detailed diagnostics.
+- Minimum time estimates use 2.5x first blood; full Machines use user FB + root FB.
 """
 
 from __future__ import annotations
@@ -1145,11 +1146,24 @@ def _dp_choose_min_cost(groups: List[List[Optional[Action]]], needed_points: flo
 
 
 def _fb_key_minutes(a: Action) -> float:
-    times: List[float] = []
-    if a.fb_user_min is not None and a.fb_user_min > 0:
-        times.append(float(a.fb_user_min))
-    if a.fb_root_min is not None and a.fb_root_min > 0:
-        times.append(float(a.fb_root_min))
+    user = float(a.fb_user_min) if a.fb_user_min is not None and a.fb_user_min > 0 else None
+    root = float(a.fb_root_min) if a.fb_root_min is not None and a.fb_root_min > 0 else None
+
+    if a.kind == "machine_full":
+        if user is not None and root is not None:
+            return user + root
+        if user is not None:
+            return user
+        if root is not None:
+            return root
+        return float("inf")
+
+    if a.kind == "machine_upgrade_root":
+        return root if root is not None else float("inf")
+    if a.kind == "machine_user":
+        return user if user is not None else float("inf")
+
+    times = [value for value in (user, root) if value is not None]
     return min(times) if times else float("inf")
 
 
