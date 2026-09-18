@@ -210,9 +210,48 @@ class PlannerTests(unittest.TestCase):
         self.assertAlmostEqual(planner._needed_points(snap, 45.0, strict=True), 0.1, places=12)
         self.assertEqual(planner._needed_points(snap, 45.0, strict=False), 0.0)
 
-    def test_root_upgrade_uses_incremental_first_blood_gap(self):
-        self.assertEqual(planner._estimate_root_upgrade_minutes(6.0, 18.0, 5.0), 12.0)
-        self.assertEqual(planner._estimate_root_upgrade_minutes(None, 18.0, 5.0), 18.0)
+    def test_first_blood_multiplier_is_fixed_at_two_point_five(self):
+        self.assertEqual(planner.FIRST_BLOOD_ESTIMATE_MULTIPLIER, 2.5)
+
+    def test_minimum_estimate_multiplies_single_first_blood(self):
+        self.assertEqual(
+            planner._minimum_estimate_from_first_blood(10.0, 5.0, "challenge"),
+            25.0,
+        )
+        self.assertEqual(
+            planner._minimum_estimate_from_first_blood(6.0, 5.0, "machine"),
+            15.0,
+        )
+
+    def test_minimum_estimate_uses_difficulty_only_when_first_blood_missing(self):
+        self.assertEqual(
+            planner._minimum_estimate_from_first_blood(None, 5.0, "challenge"),
+            planner._estimate_minutes_from_difficulty(5.0, "challenge"),
+        )
+        self.assertEqual(
+            planner._minimum_estimate_from_first_blood(None, 5.0, "machine"),
+            planner._estimate_minutes_from_difficulty(5.0, "machine"),
+        )
+
+    def test_full_machine_adds_user_and_root_blood_before_multiplier(self):
+        self.assertEqual(
+            planner._minimum_estimate_full_machine(6.0, 18.0, 5.0),
+            60.0,
+        )
+
+    def test_full_machine_with_one_blood_uses_available_blood(self):
+        self.assertEqual(
+            planner._minimum_estimate_full_machine(6.0, None, 5.0),
+            15.0,
+        )
+        self.assertEqual(
+            planner._minimum_estimate_full_machine(None, 18.0, 5.0),
+            45.0,
+        )
+
+    def test_root_upgrade_uses_root_blood_times_multiplier(self):
+        self.assertEqual(planner._estimate_root_upgrade_minutes(6.0, 18.0, 5.0), 45.0)
+        self.assertEqual(planner._estimate_root_upgrade_minutes(None, 18.0, 5.0), 45.0)
 
     def test_max_available_points_uses_best_option_per_group(self):
         groups = [
