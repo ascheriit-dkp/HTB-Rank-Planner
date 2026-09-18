@@ -39,7 +39,8 @@ from email.utils import parsedate_to_datetime
 
 import requests
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
+FIRST_BLOOD_ESTIMATE_MULTIPLIER = 2.5
 
 
 # ---------------- Errors ----------------
@@ -371,6 +372,31 @@ def _estimate_minutes_from_difficulty(diff_0_10: float, kind: str) -> float:
     if kind == "challenge":
         return 5.0 + t * 75.0
     return 40.0 + t * 440.0
+
+
+def _minimum_estimate_from_first_blood(
+    first_blood_min: Optional[float],
+    difficulty: float,
+    kind: str,
+) -> float:
+    if first_blood_min is not None and first_blood_min > 0:
+        return _clamp_est_minutes(first_blood_min * FIRST_BLOOD_ESTIMATE_MULTIPLIER)
+    return _clamp_est_minutes(_estimate_minutes_from_difficulty(difficulty, kind))
+
+
+def _minimum_estimate_full_machine(
+    user_blood_min: Optional[float],
+    root_blood_min: Optional[float],
+    difficulty: float,
+) -> float:
+    blood_parts = [
+        float(value)
+        for value in (user_blood_min, root_blood_min)
+        if value is not None and value > 0
+    ]
+    if blood_parts:
+        return _clamp_est_minutes(sum(blood_parts) * FIRST_BLOOD_ESTIMATE_MULTIPLIER)
+    return _clamp_est_minutes(_estimate_minutes_from_difficulty(difficulty, "machine"))
 
 
 # ---------------- Disk cache + index ----------------
@@ -1196,15 +1222,8 @@ def _estimate_root_upgrade_minutes(
     root_blood_min: Optional[float],
     difficulty: float,
 ) -> float:
-    if (
-        user_blood_min is not None
-        and root_blood_min is not None
-        and root_blood_min > user_blood_min
-    ):
-        return _clamp_est_minutes(root_blood_min - user_blood_min)
-    if root_blood_min is not None:
-        return _clamp_est_minutes(root_blood_min)
-    return _clamp_est_minutes(_estimate_minutes_from_difficulty(difficulty, "machine"))
+    del user_blood_min  # kept in the signature for callers/action metadata
+    return _minimum_estimate_from_first_blood(root_blood_min, difficulty, "machine")
 
 
 def _max_available_points(groups: Sequence[Sequence[Optional[Action]]]) -> float:
@@ -1229,11 +1248,11 @@ def print_plan(title: str, snapshot: OwnershipSnapshot, chosen: List[Action], to
     gained, proj_pct, flags, minutes = _summarize(snapshot, chosen)
 
     print(title)
-    print(f"  Steps: {len(chosen)}   Flags: {flags}   Est time: {_format_minutes(minutes)}")
+    print(f"  Steps: {len(chosen)}   Flags: {flags}   Min est time: {_format_minutes(minutes)}")
     print(f"  Projected ownership%: {proj_pct:.4f}%   (gain {gained:.4f} numerator points)")
     print("  Recommended actions:")
-    print(f"    {'type':12s} | {'name':28s} | {'diff':>5s} | {'fb(u/r)':>11s} | {'est':>6s} | {'gain':>8s} | {'gain/min':>9s} | {'flags':>5s}")
-    print(f"    {'-'*12}-+-{'-'*28}-+-{'-'*5}-+-{'-'*11}-+-{'-'*6}-+-{'-'*8}-+-{'-'*9}-+-{'-'*5}")
+    print(f"    {'type':12s} | {'name':28s} | {'diff':>5s} | {'fb(u/r)':>11s} | {'min est':>7s} | {'gain':>8s} | {'gain/min':>9s} | {'flags':>5s}")
+    print(f"    {'-'*12}-+-{'-'*28}-+-{'-'*5}-+-{'-'*11}-+-{'-'*7}-+-{'-'*8}-+-{'-'*9}-+-{'-'*5}")
 
     shown = 0
     for a in chosen:
@@ -1251,7 +1270,7 @@ def print_plan(title: str, snapshot: OwnershipSnapshot, chosen: List[Action], to
             r = _format_minutes(a.fb_root_min) if a.fb_root_min is not None else "-"
             fb = f"{u}/{r}"
 
-        print(f"    {a.kind:12s} | {a.name:28.28s} | {a.difficulty:5.1f} | {fb:>11s} | {_format_minutes(a.est_minutes):>6s} | {gain_pct:7.4f}% | {gm:9.5f} | {a.flags:5d}")
+        print(f"    {a.kind:12s} | {a.name:28.28s} | {a.difficulty:5.1f} | {fb:>11s} | {_format_minutes(a.est_minutes):>7s} | {gain_pct:7.4f}% | {gm:9.5f} | {a.flags:5d}")
         shown += 1
     print()
 
@@ -1643,11 +1662,11 @@ def main() -> int:
         diff = _extract_user_rated_difficulty(m)
         fu, fr = machine_fb.get(mid, (None, None))
 
-        user_est = _clamp_est_minutes(fu if fu is not None else _estimate_minutes_from_difficulty(diff, "machine"))
-        root_est = _clamp_est_minutes(fr if fr is not None else _estimate_minutes_from_difficulty(diff, "machine"))
+        user_est = _minimum_estimate_from_first_blood(fu, diff, "machine")
+        full_est = _minimum_estimate_full_machine(fu, fr, diff)
 
         a_user = Action("machine_user", f"machine:{mid}", mid, name, diff, 0.5, 1, user_est, fu, None)
-        a_full = Action("machine_full", f"machine:{mid}", mid, name, diff, 1.5, 2, root_est, fu, fr)
+        a_full = Action("machine_full", f"machine:{mid}", mid, name, diff, 1.5, 2, full_est, fu, fr)
         groups.append([None, a_user, a_full])
 
     for m in user_only_machines:
@@ -1667,7 +1686,7 @@ def main() -> int:
         diff = _extract_user_rated_difficulty(base) if isinstance(base, dict) else 5.5
 
         fbm = challenge_fb.get(cid)
-        est = _clamp_est_minutes(fbm if fbm is not None else _estimate_minutes_from_difficulty(diff, "challenge"))
+        est = _minimum_estimate_from_first_blood(fbm, diff, "challenge")
         a_ch = Action("challenge", f"chall:{cid}", cid, name, diff, 0.1, 1, est, fbm, None)
         groups.append([None, a_ch])
 
@@ -1698,7 +1717,7 @@ def main() -> int:
 
     hybrid = _dp_choose_min_cost(groups, needed_points, cost_hybrid, tie_hybrid)
 
-    print_plan("Fastest path (DP minimizes total estimated time)", snap, fastest.chosen, args.top)
+    print_plan("Fastest path (DP minimizes minimum estimated time)", snap, fastest.chosen, args.top)
     print_plan("Easiest path (greedy: lowest user-rated difficulty, then first-blood time)", snap, easiest.chosen, args.top)
     print_plan("Hybrid path (DP minimizes weighted time + difficulty)", snap, hybrid.chosen, args.top)
 
@@ -1722,6 +1741,8 @@ def main() -> int:
         )
     print("  - Cold start time is limited by HTB API rate limits for item-detail endpoints.")
     print("  - With caching enabled, later runs fetch detail data only for newly active IDs.")
+    print(f"  - Minimum estimate uses {FIRST_BLOOD_ESTIMATE_MULTIPLIER:g}x first-blood time when available.")
+    print("  - For a full Machine, user FB + root FB are added before applying the multiplier.")
     print("  - First-blood time is a heuristic, not a personal completion-time prediction.")
     return 0
 
