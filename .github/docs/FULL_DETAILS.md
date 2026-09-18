@@ -104,13 +104,26 @@ A user-only Machine recommendation is deliberately restricted:
 
 ## First-blood data
 
-First-blood times are used as a heuristic for how quickly content was solved after release.
+First-blood times are used as a lower-bound heuristic for how quickly content was solved after release.
 
 They are not a prediction of how long a specific user will take.
 
+When first-blood data is available, the planner calls the result a **minimum estimated time** and uses a fixed multiplier of **2.5x**:
+
+```text
+Challenge           min estimate = challenge FB × 2.5
+Machine user        min estimate = user FB × 2.5
+Machine root-only   min estimate = root FB × 2.5
+Full Machine        min estimate = (user FB + root FB) × 2.5
+```
+
+For a full Machine, user and root first-blood times are added before applying the multiplier; the planner no longer uses only the longest of the two.
+
+If only part of the Machine first-blood data is available, the normal difficulty-based fallback remains a floor so incomplete data cannot make a full Machine look artificially cheap. If no usable first-blood data is available, the planner uses the difficulty-based fallback directly.
+
 Machine profiles are parsed for user and root first-blood values. Challenge detail responses are walked recursively because the field shape has changed across HTB responses and community observations.
 
-Sub-minute values are displayed in seconds where possible. Estimated planner time is clamped to at least one minute to avoid unrealistic optimization around tiny first-blood values.
+Sub-minute values are displayed in seconds where possible. Minimum estimated planner time is clamped to at least one minute to avoid unrealistic optimization around tiny first-blood values.
 
 ## Difficulty normalization
 
@@ -254,7 +267,9 @@ Historical profile totals such as all-time `user_owns` and `system_owns` may rem
 
 ## Example output
 
-The output below is representative of a real run, with the account state adjusted so the active Ownership matches the displayed rank. Exact recommendations can change as HTB's active content, ratings, and first-blood data change.
+The output below is representative of a real v1.1.0 run, with the account state adjusted so the active Ownership matches the displayed rank. Exact recommendations can change as HTB's active content, ratings, and first-blood data change.
+
+**Timing note:** v1.1.1 changes the timing model to the 2.5x minimum-estimate rules documented above. The Ownership/rank parts of this example remain representative, but the v1.1.0 `Est time` values below are intentionally preserved as historical output until the example is refreshed from a live v1.1.1 run.
 
 ```text
 HTB Rank Planner v1.1.0 — user: example (id=1234567)  tz=Europe/Paris
@@ -376,6 +391,7 @@ The test suite covers core behaviors including:
 - Machine active/retired parsing;
 - restrictive cache-file permissions;
 - user-only Machine restrictions in DP and Easiest planning;
+- 2.5x first-blood minimum-estimate formulas, including full-Machine user+root addition;
 - root-upgrade timing;
 - HTTP status propagation and clean error messages;
 - retry/rate-limiter interaction;
@@ -384,7 +400,7 @@ The test suite covers core behaviors including:
 ## Known limitations
 
 - HTB Labs API v4 is not a stable public contract. Endpoint paths or response fields can change.
-- First-blood time is only a heuristic.
+- First-blood time is only a heuristic; the 2.5x multiplier is deliberately a minimum estimate, not a personal solve-time prediction.
 - Difficulty ratings are community/user-rated data, not objective solve-time estimates.
 - A cold cache may require many API calls.
 - Planner results optimize the available metrics; they cannot account for a user's specific strengths, spoilers, prior knowledge, team help, or preferred categories unless those preferences are explicitly added later.
