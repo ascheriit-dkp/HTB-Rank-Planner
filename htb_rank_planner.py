@@ -189,6 +189,8 @@ def _normalize_to_0_10(x: float) -> float:
     if x is None:
         return 5.5
     v = float(x)
+    if not math.isfinite(v):
+        return 5.5
     if v > 10.0 and v <= 100.0:
         v = v / 10.0
     return max(0.0, min(10.0, v))
@@ -238,6 +240,9 @@ _TIME_RE_HMS = re.compile(r"^\s*(\d{1,3}):(\d{2})(?::(\d{2}))?\s*$")
 
 def _parse_any_time_to_minutes(v: Any, *, numeric_unit: str = "minutes") -> Optional[float]:
     if v is None:
+        return None
+
+    if isinstance(v, bool):
         return None
 
     if isinstance(v, (int, float)):
@@ -410,7 +415,8 @@ class DiskCache:
             self._ensure_dir()
             p = self._path(key)
             tmp = p + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(value, f)
             os.replace(tmp, p)
             try:
@@ -472,7 +478,8 @@ class CacheIndex:
             try:
                 self._ensure_parent()
                 tmp = self.path + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as f:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
                     json.dump(data, f)
                 os.replace(tmp, self.path)
                 try:
