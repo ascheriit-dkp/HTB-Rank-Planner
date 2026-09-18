@@ -116,6 +116,8 @@ Sub-minute values are displayed in seconds where possible. Estimated planner tim
 
 Difficulty values are normalized to a 0–10 scale. Values returned on a 0–100 style scale are divided by ten, so a value such as `54` becomes `5.4`.
 
+Explicit difficulty fields are preferred. Generic `stars` / content-rating fields are not treated as difficulty.
+
 If no usable difficulty can be extracted, the planner uses a neutral fallback.
 
 ## Caching
@@ -132,7 +134,7 @@ Cache data is namespaced using a SHA-256 hash of the HTB token:
 
 The raw token is not stored in the directory name.
 
-Where supported, cache directories are restricted to mode `0700` and cache files to `0600`.
+Where supported, cache directories are restricted to mode `0700` and cache files, including temporary writes, to `0600`.
 
 Item detail data is fetched incrementally. After the first run, later runs normally request detail data only for newly active content. Cached entries for content that is no longer active are pruned.
 
@@ -157,6 +159,8 @@ Every actual HTTP retry passes through the limiter again. A network failure or H
 The rate-limit values are configurable from the CLI rather than being treated as guaranteed HTB limits.
 
 Cold starts can still take time because Challenge detail data requires many requests. Cached runs should be considerably faster.
+
+If an optional Machine/Challenge detail request still fails after retries, the planner falls back to its difficulty-based timing estimate instead of throwing away the whole plan. Authentication failure remains fatal.
 
 ## Token handling
 
@@ -212,6 +216,7 @@ python3 htb_rank_planner.py --help
 Important options include:
 
 ```text
+--version                 print the planner version
 --token TOKEN             HTB token; less safe than token-file/env usage
 --token-file PATH         read token from a file or stdin with '-'
 --debug                   request/rate-limit diagnostics; token is not printed
@@ -249,7 +254,7 @@ Historical profile totals such as all-time `user_owns` and `system_owns` may rem
 
 ## Example output
 
-The output below is based on a real run, with the account state adjusted so the active Ownership matches the displayed rank.
+The output below is representative of a real run, with the account state adjusted so the active Ownership matches the displayed rank. Exact recommendations can change as HTB's active content, ratings, and first-blood data change.
 
 ```text
 HTB Rank Planner v1.1.0 — user: example (id=1234567)  tz=Europe/Paris
@@ -367,8 +372,9 @@ The test suite covers core behaviors including:
 - rank thresholds and retained-rank progress;
 - Ownership math and strict-threshold crossing;
 - difficulty normalization;
-- first-blood parsing and false-positive rejection;
+- first-blood parsing, explicit units, and false-positive rejection;
 - Machine active/retired parsing;
+- restrictive cache-file permissions;
 - user-only Machine restrictions in DP and Easiest planning;
 - root-upgrade timing;
 - HTTP status propagation and clean error messages;
