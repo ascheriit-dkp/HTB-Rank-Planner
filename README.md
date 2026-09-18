@@ -6,7 +6,7 @@ It will give u the fastest path, the easiest path, and a hybrid way.<br>
 And it takes into account both the active machines and the challenges and differentiate the one you completed and the one u didn't.
 
 ```
-git clone --single-branch https://github.com/ascheriit-dkp/HTB-Rank-Planner.git
+git clone --depth 1 --single-branch https://github.com/ascheriit-dkp/HTB-Rank-Planner.git
 cd HTB-Rank-Planner
 python3 -m pip install -r requirements.txt
 # Go into ur browser in ur HTB Labs tab, open the settings > scroll down > API token > create one > copy it.
