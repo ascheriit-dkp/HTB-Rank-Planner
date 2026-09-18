@@ -221,7 +221,6 @@ def _extract_user_rated_difficulty(obj: Dict[str, Any]) -> float:
         "user_difficulty", "userDifficulty",
         "difficulty_rating", "difficultyRating",
         "avg_difficulty", "avgDifficulty",
-        "rating", "stars",
         "difficulty", "difficultyText",
     ):
         if k in obj:
@@ -987,7 +986,14 @@ def extract_challenge_first_blood_minutes(payload: Dict[str, Any]) -> Optional[f
             semantic = (
                 "first" in leaf
                 and ("blood" in leaf or "solve" in leaf)
-                and ("time" in leaf or "duration" in leaf or "difference" in leaf)
+                and (
+                    "time" in leaf
+                    or "duration" in leaf
+                    or "difference" in leaf
+                    or "second" in leaf
+                    or "minute" in leaf
+                    or "hour" in leaf
+                )
             )
             if not semantic:
                 continue
@@ -1169,6 +1175,13 @@ def _choose_easiest_greedy(groups: List[List[Optional[Action]]], needed_points: 
         total_minutes=sum(x.est_minutes for x in chosen),
         total_difficulty=sum(x.difficulty for x in chosen),
     )
+
+
+def _detail_error_is_fatal(exc: HTBApiError) -> bool:
+    # Authentication failure invalidates the whole run. Detail-endpoint outages,
+    # access restrictions and rate-limit exhaustion only affect the timing
+    # heuristic, so the planner can safely fall back to difficulty estimates.
+    return exc.status_code == 401
 
 
 def _estimate_root_upgrade_minutes(
@@ -1528,9 +1541,16 @@ def main() -> int:
 
     machine_name_by_id = {m.get("id"): m.get("name") for m in machines if isinstance(m.get("id"), int)}
 
-    def fetch_machine(mid: int) -> Tuple[int, Tuple[Optional[float], Optional[float]], str]:
-        profm = client.get_machine_profile_cached(mid, machine_name_by_id.get(mid))
-        return mid, _parse_machine_fb(profm), f"machine_profile:{mid}"
+    machine_detail_failures = 0
+
+    def fetch_machine(mid: int) -> Tuple[int, Tuple[Optional[float], Optional[float]], str, bool, Optional[HTBApiError]]:
+        try:
+            profm = client.get_machine_profile_cached(mid, machine_name_by_id.get(mid))
+        except HTBApiError as exc:
+            if _detail_error_is_fatal(exc):
+                raise
+            return mid, (None, None), f"machine_profile:{mid}", False, exc
+        return mid, _parse_machine_fb(profm), f"machine_profile:{mid}", isinstance(profm, dict), None
 
     if to_fetch_machines:
         with ThreadPoolExecutor(max_workers=max(1, client.workers)) as ex:
@@ -1538,9 +1558,11 @@ def main() -> int:
             done = 0
             total = len(futs)
             for fut in as_completed(futs):
-                mid, tup, ck = fut.result()
+                mid, tup, ck, cacheable, detail_error = fut.result()
                 machine_fb[mid] = tup
-                if cache_enabled:
+                if detail_error is not None:
+                    machine_detail_failures += 1
+                if cache_enabled and cacheable:
                     mp_index[str(mid)] = ck
                 done += 1
                 if args.show_progress:
@@ -1571,10 +1593,17 @@ def main() -> int:
                 continue
         to_fetch_chals.append(cid)
 
-    def fetch_chal(cid: Any) -> Tuple[Any, Optional[float], str]:
-        det = client.get_challenge_info_cached(cid)
+    challenge_detail_failures = 0
+
+    def fetch_chal(cid: Any) -> Tuple[Any, Optional[float], str, bool, Optional[HTBApiError]]:
+        try:
+            det = client.get_challenge_info_cached(cid)
+        except HTBApiError as exc:
+            if _detail_error_is_fatal(exc):
+                raise
+            return cid, None, f"challenge_info:{cid}", False, exc
         mm = extract_challenge_first_blood_minutes(det) if isinstance(det, dict) else None
-        return cid, mm, f"challenge_info:{cid}"
+        return cid, mm, f"challenge_info:{cid}", isinstance(det, dict), None
 
     if to_fetch_chals:
         with ThreadPoolExecutor(max_workers=max(1, client.workers)) as ex:
@@ -1582,10 +1611,12 @@ def main() -> int:
             done = 0
             total = len(futs)
             for fut in as_completed(futs):
-                cid, mm, ck = fut.result()
+                cid, mm, ck, cacheable, detail_error = fut.result()
                 if mm is not None:
                     challenge_fb[cid] = mm
-                if cache_enabled:
+                if detail_error is not None:
+                    challenge_detail_failures += 1
+                if cache_enabled and cacheable:
                     ci_index[str(cid)] = ck
                 done += 1
                 if args.show_progress:
@@ -1677,6 +1708,11 @@ def main() -> int:
     print()
 
     print("Notes")
+    if machine_detail_failures or challenge_detail_failures:
+        print(
+            f"  - Detail requests failed after retries: machines={machine_detail_failures}, "
+            f"challenges={challenge_detail_failures}; fallback estimates were used."
+        )
     print("  - Cold start time is limited by HTB API rate limits for item-detail endpoints.")
     print("  - With caching enabled, later runs fetch detail data only for newly active IDs.")
     print("  - First-blood time is a heuristic, not a personal completion-time prediction.")
