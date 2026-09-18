@@ -389,14 +389,23 @@ def _minimum_estimate_full_machine(
     root_blood_min: Optional[float],
     difficulty: float,
 ) -> float:
-    blood_parts = [
-        float(value)
-        for value in (user_blood_min, root_blood_min)
-        if value is not None and value > 0
-    ]
-    if blood_parts:
-        return _clamp_est_minutes(sum(blood_parts) * FIRST_BLOOD_ESTIMATE_MULTIPLIER)
-    return _clamp_est_minutes(_estimate_minutes_from_difficulty(difficulty, "machine"))
+    user_ok = user_blood_min is not None and user_blood_min > 0
+    root_ok = root_blood_min is not None and root_blood_min > 0
+
+    if user_ok and root_ok:
+        return _clamp_est_minutes(
+            (float(user_blood_min) + float(root_blood_min))
+            * FIRST_BLOOD_ESTIMATE_MULTIPLIER
+        )
+
+    fallback = _clamp_est_minutes(_estimate_minutes_from_difficulty(difficulty, "machine"))
+    available = user_blood_min if user_ok else root_blood_min
+    if available is not None:
+        return max(
+            fallback,
+            _clamp_est_minutes(float(available) * FIRST_BLOOD_ESTIMATE_MULTIPLIER),
+        )
+    return fallback
 
 
 # ---------------- Disk cache + index ----------------
