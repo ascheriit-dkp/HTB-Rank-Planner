@@ -239,14 +239,15 @@ class PlannerTests(unittest.TestCase):
             60.0,
         )
 
-    def test_full_machine_with_one_blood_uses_available_blood(self):
+    def test_full_machine_with_partial_blood_keeps_difficulty_fallback_floor(self):
+        fallback = planner._estimate_minutes_from_difficulty(5.0, "machine")
         self.assertEqual(
             planner._minimum_estimate_full_machine(6.0, None, 5.0),
-            15.0,
+            fallback,
         )
         self.assertEqual(
             planner._minimum_estimate_full_machine(None, 18.0, 5.0),
-            45.0,
+            fallback,
         )
 
     def test_root_upgrade_uses_root_blood_times_multiplier(self):
