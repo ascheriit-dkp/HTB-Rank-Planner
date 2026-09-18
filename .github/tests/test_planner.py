@@ -1,5 +1,8 @@
 import importlib.util
+import os
+import stat
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -120,6 +123,7 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(planner._parse_any_time_to_minutes("01:02:30"), 62.5)
 
     def test_numeric_time_has_explicit_units_without_boundary_jump(self):
+        self.assertIsNone(planner._parse_any_time_to_minutes(True))
         self.assertEqual(planner._parse_any_time_to_minutes(120), 120.0)
         self.assertEqual(planner._parse_any_time_to_minutes(121), 121.0)
         self.assertEqual(
@@ -129,6 +133,19 @@ class PlannerTests(unittest.TestCase):
 
     def test_time_format_carries_rounded_sixty_minutes(self):
         self.assertEqual(planner._format_minutes(119.6), "2h00m")
+
+    def test_non_finite_difficulty_uses_neutral_fallback(self):
+        self.assertEqual(planner._normalize_to_0_10(float("nan")), 5.5)
+        self.assertEqual(planner._normalize_to_0_10(float("inf")), 5.5)
+
+    def test_cache_file_is_written_with_restrictive_permissions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = planner.DiskCache(tmp, ttl_seconds=None, enabled=True)
+            cache.set("key", {"ok": True})
+            path = cache._path("key")
+            self.assertEqual(cache.get("key"), {"ok": True})
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
 
     def test_challenge_first_blood_known_fields(self):
         self.assertAlmostEqual(
