@@ -6,16 +6,16 @@ Rank-aware planner for active HTB Machines and Challenges.
 
 Current version improvements:
 - Uses challenge/list for active challenge metadata; avoids /challenges paging.
-- TWO-CACHE approach:
-  - list cache (TTL)
-  - item cache (FOREVER) for machine/profile/* and challenge/info/*
+- Long-lived per-item cache for machine/profile/* and challenge/info/*.
 - Incremental pulls: only fetch item endpoints for NEW active IDs.
 - Prunes cached items that are no longer active.
 - Rolling-window rate limiter + GLOBAL limiter + cooldown-on-429 to prevent cascaded 429s.
+- Every HTTP retry is rate-limited, including network and 5xx retries.
 - No-dependency progress bars.
 - Uses the API-reported retained rank/next rank so retirement rank protection is handled correctly.
 - Accepts current challenge solve aliases including authUserSolve.
-- Retries transient network/5xx failures in addition to 429s.
+- Validates/parses difficulty and first-blood fields conservatively.
+- Clean CLI errors by default; --debug keeps detailed diagnostics.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -38,13 +39,24 @@ from email.utils import parsedate_to_datetime
 
 import requests
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 
 # ---------------- Errors ----------------
 
 class HTBApiError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int] = None,
+        method: Optional[str] = None,
+        url: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.method = method
+        self.url = url
 
 
 # ---------------- Helpers ----------------
@@ -189,14 +201,14 @@ def _difficulty_from_value(v: Any) -> Optional[float]:
         return _normalize_to_0_10(float(v))
     if isinstance(v, str):
         s = v.strip().lower()
-        mapping_0_100 = {
-            "very easy": 10.0, "too easy": 15.0, "easy": 25.0,
-            "medium": 50.0,
-            "hard": 75.0, "too hard": 82.0,
-            "insane": 90.0, "brainfuck": 95.0,
+        mapping_0_10 = {
+            "very easy": 1.0, "too easy": 1.5, "easy": 2.5,
+            "medium": 5.0,
+            "hard": 7.5, "too hard": 8.2,
+            "insane": 9.0, "brainfuck": 9.5,
         }
-        if s in mapping_0_100:
-            return _normalize_to_0_10(mapping_0_100[s])
+        if s in mapping_0_10:
+            return mapping_0_10[s]
         try:
             return _normalize_to_0_10(float(s))
         except Exception:
@@ -225,21 +237,21 @@ _TIME_RE_DHMS = re.compile(r"(?:(\d+)\s*D)?\s*(?:(\d+)\s*H)?\s*(?:(\d+)\s*M)?\s*
 _TIME_RE_HMS = re.compile(r"^\s*(\d{1,3}):(\d{2})(?::(\d{2}))?\s*$")
 
 
-def _parse_any_time_to_minutes(v: Any) -> Optional[float]:
+def _parse_any_time_to_minutes(v: Any, *, numeric_unit: str = "minutes") -> Optional[float]:
     if v is None:
         return None
 
     if isinstance(v, (int, float)):
         x = float(v)
-        if x <= 0:
+        if not math.isfinite(x) or x <= 0:
             return None
-        if x > 500:
-            if x > 10_000_000_000:
-                return None
+        if numeric_unit == "seconds":
             return x / 60.0
-        if x <= 120:
+        if numeric_unit == "hours":
+            return x * 60.0
+        if numeric_unit == "minutes":
             return x
-        return x / 60.0
+        return None
 
     if not isinstance(v, str):
         return None
@@ -270,7 +282,7 @@ def _parse_any_time_to_minutes(v: Any) -> Optional[float]:
             return total_minutes
 
     try:
-        return _parse_any_time_to_minutes(float(s))
+        return _parse_any_time_to_minutes(float(s), numeric_unit=numeric_unit)
     except Exception:
         return None
 
@@ -285,8 +297,8 @@ def _format_minutes(m: Optional[float]) -> str:
         return f"{secs}s"
     if m < 90:
         return f"{m:.0f}m"
-    h = int(m // 60)
-    mm = int(round(m - 60 * h))
+    total_rounded = int(round(m))
+    h, mm = divmod(total_rounded, 60)
     return f"{h}h{mm:02d}m"
 
 
@@ -324,6 +336,29 @@ def _challenge_solved_flag(item: Dict[str, Any]) -> bool:
                 if k in v and _as_bool(v.get(k)):
                     return True
     return False
+
+
+def _index_active_challenges(items: Sequence[Dict[str, Any]]) -> Tuple[List[Any], Dict[str, Dict[str, Any]]]:
+    active_ids: List[Any] = []
+    active_by_id: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        cid = _challenge_id(item)
+        if cid is None:
+            continue
+        key = str(cid)
+        if key in active_by_id:
+            continue
+        active_ids.append(cid)
+        active_by_id[key] = item
+    return active_ids, active_by_id
+
+
+def _machine_is_active(item: Dict[str, Any]) -> bool:
+    if "retired" in item and _as_bool(item.get("retired")):
+        return False
+    if item.get("active") is not None and not _as_bool(item.get("active")):
+        return False
+    return True
 
 
 def _estimate_minutes_from_difficulty(diff_0_10: float, kind: str) -> float:
@@ -518,7 +553,6 @@ class HTBClient:
     debug: bool = False
     workers: int = 24
 
-    cache_lists: Optional[DiskCache] = None
     cache_items: Optional[DiskCache] = None
     cache_index: Optional[CacheIndex] = None
 
@@ -553,7 +587,7 @@ class HTBClient:
         ep = endpoint.lstrip("/")
         if ep.startswith("challenge/info/") or ep.startswith("machine/profile/"):
             return self.cache_items
-        return self.cache_lists
+        return None
 
     def request(
         self,
@@ -590,12 +624,6 @@ class HTBClient:
                 return hit
 
         bucket = self._bucket_for(endpoint)
-
-        # acquire GLOBAL + endpoint bucket (prevents global quota 429 + endpoint quota 429)
-        if self.limiter:
-            self.limiter.acquire("global")
-            self.limiter.acquire(bucket)
-
         max_tries = 6
 
         def retry_after_seconds(raw: Optional[str], fallback: float) -> float:
@@ -611,11 +639,20 @@ class HTBClient:
                     return fallback
 
         for attempt in range(max_tries):
+            # Every actual HTTP attempt, including retries, passes through the
+            # configured global and endpoint rolling-window limits.
+            if self.limiter:
+                self.limiter.acquire("global")
+                self.limiter.acquire(bucket)
             try:
                 r = self._session().request(method, url, headers=headers, params=params, json=json_body, timeout=self.timeout)
             except requests.RequestException as e:
                 if attempt + 1 >= max_tries:
-                    raise HTBApiError(f"{method} {url} failed after {max_tries} attempts: {e}") from e
+                    raise HTBApiError(
+                        f"{method} {url} failed after {max_tries} attempts: {e}",
+                        method=method,
+                        url=url,
+                    ) from e
                 wait_s = min(20.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.25)
                 if self.debug:
                     print(f"[DEBUG] network error: retrying in {wait_s:.2f}s: {e}", file=sys.stderr)
@@ -633,12 +670,10 @@ class HTBClient:
                     print(f"[DEBUG] 429: cooldown {wait_s:.1f}s (bucket={bucket})", file=sys.stderr)
 
                 if self.limiter:
-                    # cooldown both bucket + global so all worker threads stop stampeding
+                    # Cool down both buckets. The next retry goes through
+                    # acquire() again, so it waits and is rate-counted there.
                     self.limiter.note_429(bucket, wait_s)
                     self.limiter.note_429("global", wait_s)
-                    time.sleep(wait_s)
-                    self.limiter.acquire("global")
-                    self.limiter.acquire(bucket)
                 else:
                     time.sleep(wait_s)
                 continue
@@ -646,7 +681,12 @@ class HTBClient:
             if 500 <= r.status_code <= 599:
                 if attempt + 1 >= max_tries:
                     snippet = r.text[:450].replace("\n", " ")
-                    raise HTBApiError(f"{method} {url} -> {r.status_code} after {max_tries} attempts: {snippet}")
+                    raise HTBApiError(
+                        f"{method} {url} -> {r.status_code} after {max_tries} attempts: {snippet}",
+                        status_code=r.status_code,
+                        method=method,
+                        url=url,
+                    )
                 wait_s = min(20.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.25)
                 if self.debug:
                     print(f"[DEBUG] {r.status_code}: retrying in {wait_s:.2f}s", file=sys.stderr)
@@ -655,7 +695,12 @@ class HTBClient:
 
             if r.status_code >= 400:
                 snippet = r.text[:450].replace("\n", " ")
-                raise HTBApiError(f"{method} {url} -> {r.status_code}: {snippet}")
+                raise HTBApiError(
+                    f"{method} {url} -> {r.status_code}: {snippet}",
+                    status_code=r.status_code,
+                    method=method,
+                    url=url,
+                )
 
             if not r.text.strip():
                 return None
@@ -669,7 +714,12 @@ class HTBClient:
                 cache.set(cache_key, data)
             return data
 
-        raise HTBApiError(f"{method} {url} -> 429: rate limit (exceeded retries)")
+        raise HTBApiError(
+            f"{method} {url} -> 429: rate limit (exceeded retries)",
+            status_code=429,
+            method=method,
+            url=url,
+        )
 
     def _fetch_all_pages(self, endpoint: str, *, per_page: int = 100, use_cache: bool = True) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         per_page = min(int(per_page), 100)
@@ -690,7 +740,7 @@ class HTBClient:
         if last_page <= 1:
             return _uniq_by_id(out), meta
 
-        with ThreadPoolExecutor(max_workers=max(4, self.workers)) as ex:
+        with ThreadPoolExecutor(max_workers=max(1, self.workers)) as ex:
             futs = {ex.submit(fetch_page, p): p for p in range(2, last_page + 1)}
             for fut in as_completed(futs):
                 payload = fut.result()
@@ -712,27 +762,24 @@ class HTBClient:
 
     def list_active_machines(self) -> List[Dict[str, Any]]:
         machines, _ = self._fetch_all_pages("machine/paginated", per_page=100, use_cache=False)
-        out = []
-        for m in machines:
-            if m.get("retired") in (1, "1", True):
-                continue
-            if m.get("active") is not None and int(m.get("active")) == 0:
-                continue
-            out.append(m)
-        return out
+        return [m for m in machines if _machine_is_active(m)]
 
     def get_machine_profile_cached(self, machine_id: int, machine_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
         cache_key = f"machine_profile:{machine_id}"
         try:
             return self.request(f"machine/profile/{machine_id}", use_cache=True, cache_key_override=cache_key)
-        except HTBApiError:
+        except HTBApiError as exc:
+            if exc.status_code not in {404, 422}:
+                raise
             if not machine_name:
                 return None
             try:
-                # Some current clients/documentation describe this endpoint as slug/name based.
+                # Some clients/API variants expose this endpoint by name/slug.
                 return self.request(f"machine/profile/{machine_name}", use_cache=True, cache_key_override=cache_key)
-            except HTBApiError:
-                return None
+            except HTBApiError as fallback_exc:
+                if fallback_exc.status_code in {403, 404, 422}:
+                    return None
+                raise
 
     def list_active_challenges_items(self) -> List[Dict[str, Any]]:
         payload = self.request("challenge/list", use_cache=False)
@@ -741,8 +788,10 @@ class HTBClient:
     def get_challenge_info_cached(self, cid: Any) -> Optional[Dict[str, Any]]:
         try:
             return self.request(f"challenge/info/{cid}", use_cache=True, cache_key_override=f"challenge_info:{cid}")
-        except HTBApiError:
-            return None
+        except HTBApiError as exc:
+            if exc.status_code in {403, 404, 422}:
+                return None
+            raise
 
 
 # ---------------- Ownership + Ranks ----------------
@@ -887,6 +936,21 @@ def _walk_json(obj: Any, path: str = "") -> List[Tuple[str, Any]]:
     return out
 
 
+def _duration_value_for_path(path: str, value: Any) -> Optional[float]:
+    leaf = re.sub(r"[^a-z0-9]", "", path.rsplit(".", 1)[-1].lower())
+    if isinstance(value, (int, float)):
+        # Bare numeric duration fields are ambiguous. Only accept them when the
+        # field itself declares a unit.
+        if "second" in leaf:
+            return _parse_any_time_to_minutes(value, numeric_unit="seconds")
+        if "minute" in leaf:
+            return _parse_any_time_to_minutes(value, numeric_unit="minutes")
+        if "hour" in leaf:
+            return _parse_any_time_to_minutes(value, numeric_unit="hours")
+        return None
+    return _parse_any_time_to_minutes(value)
+
+
 def extract_challenge_first_blood_minutes(payload: Dict[str, Any]) -> Optional[float]:
     if not isinstance(payload, dict):
         return None
@@ -898,21 +962,38 @@ def extract_challenge_first_blood_minutes(payload: Dict[str, Any]) -> Optional[f
             root = v
             break
 
+    exact_keys = {
+        "firstbloodtime",
+        "firstblooddifference",
+        "blooddifference",
+        "bloodtime",
+    }
+
     candidates: List[float] = []
-    for p, v in _walk_json(root):
-        pl = p.lower()
-        if ("blood" in pl) or ("first" in pl and "time" in pl):
-            mm = _parse_any_time_to_minutes(v)
-            if mm is not None and 0.0001 <= mm <= 60 * 24 * 365:
-                candidates.append(mm)
+    walked = _walk_json(root)
+    for path, value in walked:
+        leaf = re.sub(r"[^a-z0-9]", "", path.rsplit(".", 1)[-1].lower())
+        if leaf not in exact_keys:
+            continue
+        mm = _duration_value_for_path(path, value)
+        if mm is not None and 0.0001 <= mm <= 60 * 24 * 365:
+            candidates.append(mm)
 
     if not candidates:
-        for p, v in _walk_json(root):
-            pl = p.lower()
-            if "time" in pl or "duration" in pl:
-                mm = _parse_any_time_to_minutes(v)
-                if mm is not None and 0.0001 <= mm <= 60 * 24 * 365:
-                    candidates.append(mm)
+        # Compatibility fallback for renamed API fields, but require semantic
+        # "first" + ("blood" or "solve") + a duration concept.
+        for path, value in walked:
+            leaf = re.sub(r"[^a-z0-9]", "", path.rsplit(".", 1)[-1].lower())
+            semantic = (
+                "first" in leaf
+                and ("blood" in leaf or "solve" in leaf)
+                and ("time" in leaf or "duration" in leaf or "difference" in leaf)
+            )
+            if not semantic:
+                continue
+            mm = _duration_value_for_path(path, value)
+            if mm is not None and 0.0001 <= mm <= 60 * 24 * 365:
+                candidates.append(mm)
 
     return min(candidates) if candidates else None
 
@@ -1090,6 +1171,30 @@ def _choose_easiest_greedy(groups: List[List[Optional[Action]]], needed_points: 
     )
 
 
+def _estimate_root_upgrade_minutes(
+    user_blood_min: Optional[float],
+    root_blood_min: Optional[float],
+    difficulty: float,
+) -> float:
+    if (
+        user_blood_min is not None
+        and root_blood_min is not None
+        and root_blood_min > user_blood_min
+    ):
+        return _clamp_est_minutes(root_blood_min - user_blood_min)
+    if root_blood_min is not None:
+        return _clamp_est_minutes(root_blood_min)
+    return _clamp_est_minutes(_estimate_minutes_from_difficulty(difficulty, "machine"))
+
+
+def _max_available_points(groups: Sequence[Sequence[Optional[Action]]]) -> float:
+    total = 0.0
+    for group in groups:
+        gains = [opt.gain_points for opt in group if opt is not None]
+        total += max(gains, default=0.0)
+    return total
+
+
 def _summarize(snapshot: OwnershipSnapshot, chosen: List[Action]) -> Tuple[float, float, int, float]:
     gained = sum(a.gain_points for a in chosen)
     proj_num = snapshot.numer_points + gained
@@ -1144,6 +1249,7 @@ def _read_token_from_file(path: str) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="HTB Rank Planner (Labs API v4)")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     ap.add_argument("--token", default=None, help="HTB JWT token (otherwise uses env HTB_TOKEN). Prefer --token-file.")
     ap.add_argument("--token-file", default=None, help="Read token from file path (or '-' for stdin). Safer than --token.")
     ap.add_argument("--debug", action="store_true", help="Verbose request diagnostics")
@@ -1151,7 +1257,9 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=24, help="Worker threads (default 24)")
 
     ap.add_argument("--no-cache", action="store_true", help="Disable ALL disk cache")
-    ap.add_argument("--list-cache-ttl", type=int, default=6 * 3600, help="TTL for list cache (default 6h)")
+    # Accepted for v1.0.x command-line compatibility. Live list endpoints are
+    # intentionally not cached because they carry ownership/solve state.
+    ap.add_argument("--list-cache-ttl", type=int, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--show-progress", action="store_true", help="Show progress bars (stderr)")
 
     # Rolling-window limits (per 60s). We enforce GLOBAL + per-endpoint.
@@ -1165,6 +1273,20 @@ def main() -> int:
     ap.add_argument("--fb-challenge-cap", type=int, default=0, help="Cap challenge/info calls (0 = all unsolved active)")
     args = ap.parse_args()
 
+    if args.top < 0:
+        ap.error("--top must be >= 0")
+    if args.workers < 1:
+        ap.error("--workers must be >= 1")
+    for name in ("rl_global", "rl_challenge_info", "rl_machine_profile", "rl_lists"):
+        if int(getattr(args, name)) < 1:
+            ap.error(f"--{name.replace('_', '-')} must be >= 1")
+    if args.rl_margin < 0:
+        ap.error("--rl-margin must be >= 0")
+    if args.rl_window <= 0:
+        ap.error("--rl-window must be > 0")
+    if args.fb_challenge_cap < 0:
+        ap.error("--fb-challenge-cap must be >= 0")
+
     token = _read_token_from_file(args.token_file) if args.token_file else (args.token or os.environ.get("HTB_TOKEN") or "").strip()
     if not token:
         print("ERROR: Missing token. Set HTB_TOKEN or pass --token-file / --token.", file=sys.stderr)
@@ -1174,7 +1296,6 @@ def main() -> int:
     cache_root = os.path.expanduser(f"~/.cache/htb_rank_planner/{token_ns}")
 
     cache_enabled = not args.no_cache
-    cache_lists = DiskCache(os.path.join(cache_root, "lists"), ttl_seconds=int(args.list_cache_ttl), enabled=cache_enabled)
     cache_items = DiskCache(os.path.join(cache_root, "items"), ttl_seconds=None, enabled=cache_enabled)
     cache_index = CacheIndex(os.path.join(cache_root, "items", "index.json"), enabled=cache_enabled)
     idx = cache_index.load()
@@ -1190,16 +1311,19 @@ def main() -> int:
     client = HTBClient(
         token=token,
         debug=args.debug,
-        workers=max(4, int(args.workers)),
-        cache_lists=cache_lists,
+        workers=max(1, int(args.workers)),
         cache_items=cache_items,
         cache_index=cache_index,
         limiter=limiter,
     )
 
     ui = client.get_user_info()
+    if not isinstance(ui, dict):
+        raise HTBApiError("Unexpected response from user/info.")
     info = ui.get("info", {})
-    user_id = info.get("id")
+    if not isinstance(info, dict):
+        raise HTBApiError("Unexpected response shape from user/info.")
+    user_id = _safe_int(info.get("id"))
     user_name = info.get("name", "?")
     tz = info.get("timezone", "?")
     rank_id = info.get("rank_id", "?")
@@ -1212,11 +1336,15 @@ def main() -> int:
         print("ERROR: Could not determine user id from /user/info.", file=sys.stderr)
         return 2
 
-    prof = client.get_user_profile_basic(user_id).get("profile", {}) or {}
+    profile_payload = client.get_user_profile_basic(user_id)
+    if not isinstance(profile_payload, dict):
+        raise HTBApiError("Unexpected response from user/profile/basic.")
+    prof = profile_payload.get("profile", {}) or {}
+    if not isinstance(prof, dict):
+        raise HTBApiError("Unexpected response shape from user/profile/basic.")
     api_rank_name = prof.get("rank")
     api_next_rank = prof.get("next_rank")
     api_rank_ownership = _safe_float(prof.get("rank_ownership"))
-    api_current_rank_progress = _safe_float(prof.get("current_rank_progress"))
     api_user_owns = _safe_int(prof.get("user_owns"))
     api_system_owns = _safe_int(prof.get("system_owns"))
 
@@ -1224,17 +1352,10 @@ def main() -> int:
     active_machine_ids: Set[int] = {m.get("id") for m in machines if isinstance(m.get("id"), int)}
 
     active_items = client.list_active_challenges_items()
-    active_ids: List[Any] = []
-    active_by_id: Dict[str, Dict[str, Any]] = {}
-    for it in active_items:
-        cid = _challenge_id(it)
-        if cid is None:
-            continue
-        active_ids.append(cid)
-        active_by_id[str(cid)] = it
+    active_ids, active_by_id = _index_active_challenges(active_items)
 
     active_total = len(active_ids)
-    active_solved = sum(1 for it in active_items if _challenge_solved_flag(it))
+    active_solved = sum(1 for it in active_by_id.values() if _challenge_solved_flag(it))
     unsolved_active_ids = [cid for cid in active_ids if not _challenge_solved_flag(active_by_id.get(str(cid), {}))]
     unowned_active = len(unsolved_active_ids)
 
@@ -1311,8 +1432,7 @@ def main() -> int:
         print(f"  API rank:     {api_rank_name}")
     if api_next_rank:
         print(f"  API next:     {api_next_rank}")
-    base_own = api_rank_ownership if api_rank_ownership is not None else snap.ownership_percent
-    raw_ownership_gap = max(0.0, nxt_thr - base_own)
+    raw_ownership_gap = max(0.0, nxt_thr - snap.ownership_percent)
     print(f"  Raw ownership gap to {nxt_thr_text}: {raw_ownership_gap:.4f}%")
     print()
 
@@ -1333,18 +1453,13 @@ def main() -> int:
     full_abs = (1.5 / denom) * 100.0
     chal_abs = (0.1 / denom) * 100.0
 
-    user_min = _estimate_minutes_from_difficulty(5.5, "machine")
-    root_min = _estimate_minutes_from_difficulty(5.5, "machine")
-    full_min = _estimate_minutes_from_difficulty(5.5, "machine")
-    chal_min = _estimate_minutes_from_difficulty(3.0, "challenge")
-
     print("Per-action ownership gains")
-    print(f"{'type':16s} | {'absolute gain':>14s} | {'relative gain':>14s} | gain/min (est)")
-    print("-" * 72)
-    print(f"{'user on machine':16s} | {('+' + f'{user_abs:.4f}%'):>14s} | {rel(user_abs):>14s} | {user_abs/max(1e-9,user_min):14.5f}")
-    print(f"{'root on machine':16s} | {('+' + f'{root_abs:.4f}%'):>14s} | {rel(root_abs):>14s} | {root_abs/max(1e-9,root_min):14.5f}")
-    print(f"{'user + root':16s} | {('+' + f'{full_abs:.4f}%'):>14s} | {rel(full_abs):>14s} | {full_abs/max(1e-9,full_min):14.5f}")
-    print(f"{'challenge':16s} | {('+' + f'{chal_abs:.4f}%'):>14s} | {rel(chal_abs):>14s} | {chal_abs/max(1e-9,chal_min):14.5f}")
+    print(f"{'type':16s} | {'absolute gain':>14s} | {'relative gain':>14s}")
+    print("-" * 52)
+    print(f"{'user on machine':16s} | {('+' + f'{user_abs:.4f}%'):>14s} | {rel(user_abs):>14s}")
+    print(f"{'root on machine':16s} | {('+' + f'{root_abs:.4f}%'):>14s} | {rel(root_abs):>14s}")
+    print(f"{'user + root':16s} | {('+' + f'{full_abs:.4f}%'):>14s} | {rel(full_abs):>14s}")
+    print(f"{'challenge':16s} | {('+' + f'{chal_abs:.4f}%'):>14s} | {rel(chal_abs):>14s}")
     print()
 
     needed_points = _needed_points(snap, nxt_thr, strict=(nxt_rank != "Omniscient"))
@@ -1418,7 +1533,7 @@ def main() -> int:
         return mid, _parse_machine_fb(profm), f"machine_profile:{mid}"
 
     if to_fetch_machines:
-        with ThreadPoolExecutor(max_workers=max(4, client.workers)) as ex:
+        with ThreadPoolExecutor(max_workers=max(1, client.workers)) as ex:
             futs = [ex.submit(fetch_machine, mid) for mid in to_fetch_machines]
             done = 0
             total = len(futs)
@@ -1430,9 +1545,6 @@ def main() -> int:
                 done += 1
                 if args.show_progress:
                     _progress(done, total, "machine/profile")
-            if args.show_progress:
-                _progress(total, total, "machine/profile")
-
     if cache_enabled:
         idx["machine_profile"] = mp_index
         cache_index.save(idx)
@@ -1454,7 +1566,9 @@ def main() -> int:
                 mm = extract_challenge_first_blood_minutes(cached)
                 if mm is not None:
                     challenge_fb[cid] = mm
-                    continue
+                # A cached detail response with no first-blood field is still a
+                # valid cache hit; do not fetch it again every run.
+                continue
         to_fetch_chals.append(cid)
 
     def fetch_chal(cid: Any) -> Tuple[Any, Optional[float], str]:
@@ -1463,7 +1577,7 @@ def main() -> int:
         return cid, mm, f"challenge_info:{cid}"
 
     if to_fetch_chals:
-        with ThreadPoolExecutor(max_workers=max(4, client.workers)) as ex:
+        with ThreadPoolExecutor(max_workers=max(1, client.workers)) as ex:
             futs = [ex.submit(fetch_chal, cid) for cid in to_fetch_chals]
             done = 0
             total = len(futs)
@@ -1476,9 +1590,6 @@ def main() -> int:
                 done += 1
                 if args.show_progress:
                     _progress(done, total, "challenge/info")
-            if args.show_progress:
-                _progress(total, total, "challenge/info")
-
     if cache_enabled:
         idx["challenge_info"] = ci_index
         cache_index.save(idx)
@@ -1508,7 +1619,7 @@ def main() -> int:
         name = m.get("name") or f"machine#{mid}"
         diff = _extract_user_rated_difficulty(m)
         fu, fr = machine_fb.get(mid, (None, None))
-        root_est = _clamp_est_minutes(fr if fr is not None else _estimate_minutes_from_difficulty(diff, "machine"))
+        root_est = _estimate_root_upgrade_minutes(fu, fr, diff)
         a_up = Action("machine_upgrade_root", f"upgrade:{mid}", mid, name, diff, 1.0, 1, root_est, fu, fr)
         groups.append([None, a_up])
 
@@ -1521,6 +1632,16 @@ def main() -> int:
         est = _clamp_est_minutes(fbm if fbm is not None else _estimate_minutes_from_difficulty(diff, "challenge"))
         a_ch = Action("challenge", f"chall:{cid}", cid, name, diff, 0.1, 1, est, fbm, None)
         groups.append([None, a_ch])
+
+    available_points = _max_available_points(groups)
+    if available_points + 1e-9 < needed_points:
+        available_pct = (available_points / snap.denom_points) * 100.0 if snap.denom_points > 0 else 0.0
+        print(
+            f"ERROR: Current active content cannot provide enough remaining Ownership "
+            f"to reach {nxt_rank}. Maximum additional gain is +{available_pct:.4f}%.",
+            file=sys.stderr,
+        )
+        return 3
 
     def cost_time(a: Action) -> float:
         return a.est_minutes
@@ -1539,7 +1660,7 @@ def main() -> int:
 
     hybrid = _dp_choose_min_cost(groups, needed_points, cost_hybrid, tie_hybrid)
 
-    print_plan("Fastest path (maximize % gain per minute; DP minimizes total estimated time)", snap, fastest.chosen, args.top)
+    print_plan("Fastest path (DP minimizes total estimated time)", snap, fastest.chosen, args.top)
     print_plan("Easiest path (greedy: lowest user-rated difficulty, then first-blood time)", snap, easiest.chosen, args.top)
     print_plan("Hybrid path (DP minimizes weighted time + difficulty)", snap, hybrid.chosen, args.top)
 
@@ -1562,5 +1683,35 @@ def main() -> int:
     return 0
 
 
+def _friendly_api_error(exc: HTBApiError) -> str:
+    if exc.status_code == 401:
+        return "HTB rejected the token (401). Check whether it is valid or expired."
+    if exc.status_code == 403:
+        return "HTB denied the request (403). Check account/content access."
+    if exc.status_code == 429:
+        return "HTB rate limiting did not recover after the configured retries (429)."
+    if exc.status_code is not None and 500 <= exc.status_code <= 599:
+        return f"HTB API returned {exc.status_code} after retries. Try again later."
+    return str(exc)
+
+
+def _entrypoint() -> int:
+    try:
+        return main()
+    except KeyboardInterrupt:
+        print("\nERROR: Interrupted.", file=sys.stderr)
+        return 130
+    except HTBApiError as exc:
+        if "--debug" in sys.argv[1:]:
+            traceback.print_exc()
+        print(f"ERROR: {_friendly_api_error(exc)}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        if "--debug" in sys.argv[1:]:
+            traceback.print_exc()
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_entrypoint())
