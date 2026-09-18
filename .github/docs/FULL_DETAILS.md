@@ -116,14 +116,15 @@ Sub-minute values are displayed in seconds where possible. Estimated planner tim
 
 Difficulty values are normalized to a 0–10 scale. Values returned on a 0–100 style scale are divided by ten, so a value such as `54` becomes `5.4`.
 
+Explicit difficulty fields are preferred. Generic `stars` / content-rating fields are not treated as difficulty.
+
 If no usable difficulty can be extracted, the planner uses a neutral fallback.
 
 ## Caching
 
-The tool uses two cache classes:
+Live Machine and Challenge list endpoints are intentionally fetched fresh because they carry current ownership and solve state.
 
-- short-lived/list-style data where freshness matters;
-- long-lived item-detail data for Machine profiles and Challenge info.
+Long-lived caching is used only for item-detail data such as Machine profiles and Challenge info.
 
 Cache data is namespaced using a SHA-256 hash of the HTB token:
 
@@ -133,7 +134,7 @@ Cache data is namespaced using a SHA-256 hash of the HTB token:
 
 The raw token is not stored in the directory name.
 
-Where supported, cache directories are restricted to mode `0700` and cache files to `0600`.
+Where supported, cache directories are restricted to mode `0700` and cache files, including temporary writes, to `0600`.
 
 Item detail data is fetched incrementally. After the first run, later runs normally request detail data only for newly active content. Cached entries for content that is no longer active are pruned.
 
@@ -153,9 +154,13 @@ It includes:
 - retries for transient network failures and HTTP 5xx responses;
 - reduced pressure on detail-heavy endpoints.
 
+Every actual HTTP retry passes through the limiter again. A network failure or HTTP 5xx therefore cannot silently bypass the configured request budget.
+
 The rate-limit values are configurable from the CLI rather than being treated as guaranteed HTB limits.
 
 Cold starts can still take time because Challenge detail data requires many requests. Cached runs should be considerably faster.
+
+If an optional Machine/Challenge detail request still fails after retries, the planner falls back to its difficulty-based timing estimate instead of throwing away the whole plan. Authentication failure remains fatal.
 
 ## Token handling
 
@@ -176,6 +181,8 @@ python3 htb_rank_planner.py
 
 The tool does not print the token in normal output or debug output.
 
+Authentication/API failures are shown as concise CLI errors by default. `--debug` keeps detailed diagnostics for troubleshooting.
+
 Recommended token-file permissions:
 
 ```bash
@@ -189,9 +196,7 @@ Do not commit tokens, `.env` files containing tokens, or cache data.
 ```bash
 git clone --depth 1 https://github.com/ascheriit-dkp/HTB-Rank-Planner.git
 cd HTB-Rank-Planner
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 ```
 
 Then run:
@@ -211,13 +216,13 @@ python3 htb_rank_planner.py --help
 Important options include:
 
 ```text
+--version                 print the planner version
 --token TOKEN             HTB token; less safe than token-file/env usage
 --token-file PATH         read token from a file or stdin with '-'
 --debug                   request/rate-limit diagnostics; token is not printed
 --top N                   maximum actions printed per plan
 --workers N               worker-thread count
 --no-cache                disable all disk caching
---list-cache-ttl SEC      list cache TTL
 --show-progress           progress bars for uncached detail calls
 --fb-challenge-cap N      optional cap on Challenge detail calls
 --rl-global N             configured global requests/window
@@ -249,10 +254,10 @@ Historical profile totals such as all-time `user_owns` and `system_owns` may rem
 
 ## Example output
 
-The output below is based on a real run, with the account state adjusted so the active Ownership matches the displayed rank.
+The output below is representative of a real run, with the account state adjusted so the active Ownership matches the displayed rank. Exact recommendations can change as HTB's active content, ratings, and first-blood data change.
 
 ```text
-HTB Rank Planner v1.0.0 — user: example (id=1234567)  tz=Europe/Paris
+HTB Rank Planner v1.1.0 — user: example (id=1234567)  tz=Europe/Paris
 Rank (API user/info): rank_id=4
 
 Active content counts
@@ -275,22 +280,22 @@ Rank progress (like HTB profile)
   Progress:     [###########-------------] 44.9%
   API rank:     Pro Hacker
   API next:     Elite Hacker
-  Raw ownership gap to >70.0%: 13.7800%
+  Raw ownership gap to >70.0%: 13.7751%
 
 Per-action ownership gains
-type             |  absolute gain |  relative gain | gain/min (est)
-------------------------------------------------------------------------
-user on machine  |       +1.0040% |         +1.79% |        0.00356
-root on machine  |       +2.0080% |         +3.57% |        0.00712
-user + root      |       +3.0120% |         +5.36% |        0.01068
-challenge        |       +0.2008% |         +0.36% |        0.00730
+type             |  absolute gain |  relative gain
+----------------------------------------------------
+user on machine  |       +1.0040% |         +1.79%
+root on machine  |       +2.0080% |         +3.57%
+user + root      |       +3.0120% |         +5.36%
+challenge        |       +0.2008% |         +0.36%
 
 Minimum achievable gain needed to reach Elite Hacker (>70.0%): +13.8554%
 
 machine/profile [############################] 4/4
 challenge/info  [############################] 158/158
 
-Fastest path (maximize % gain per minute; DP minimizes total estimated time)
+Fastest path (DP minimizes total estimated time)
   Steps: 13   Flags: 17   Est time: 1h29m
   Projected ownership%: 70.0803%   (gain 6.9000 numerator points)
   Recommended actions:
@@ -363,13 +368,18 @@ python3 -m unittest discover -s .github/tests -p "test_*.py" -v
 
 The test suite covers core behaviors including:
 
-- active Challenge solved-field aliases;
-- rank thresholds;
-- retained-rank progress;
-- Ownership math;
-- first-blood time parsing;
-- strict-threshold crossing;
-- user-only Machine restrictions in DP and Easiest planning.
+- active Challenge solved-field aliases and duplicate-ID handling;
+- rank thresholds and retained-rank progress;
+- Ownership math and strict-threshold crossing;
+- difficulty normalization;
+- first-blood parsing, explicit units, and false-positive rejection;
+- Machine active/retired parsing;
+- restrictive cache-file permissions;
+- user-only Machine restrictions in DP and Easiest planning;
+- root-upgrade timing;
+- HTTP status propagation and clean error messages;
+- retry/rate-limiter interaction;
+- detail-endpoint fallback behavior.
 
 ## Known limitations
 
@@ -390,7 +400,7 @@ Useful additions that fit the current design:
 - a small TUI;
 - what-if simulation for future active-content changes;
 - optional personal solve-time history to replace generic first-blood estimates;
-- CI against mocked API fixtures to detect parser regressions;
+- broader saved API-response fixtures to detect future parser regressions;
 - a lightweight endpoint-compatibility check mode.
 
 ## Disclaimer
